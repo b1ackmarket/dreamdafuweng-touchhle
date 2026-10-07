@@ -79,6 +79,13 @@ index ad7376c..f7d2e9d 100644
  }
  
  cargoNdk {
+diff --git a/android/app/src/main/assets/DreamDaFuWeng.ipa b/android/app/src/main/assets/DreamDaFuWeng.ipa
+new file mode 100644
+index 0000000..d3f6b15
+Binary files /dev/null and b/android/app/src/main/assets/DreamDaFuWeng.ipa differ
+diff --git a/res/icon.png b/res/icon.png
+index 3c813bb..c36de4d 100644
+Binary files a/res/icon.png and b/res/icon.png differ
 diff --git a/src/dyld.rs b/src/dyld.rs
 index 71b8d00..ba93960 100644
 --- a/src/dyld.rs
@@ -1593,10 +1600,19 @@ index 0000000..efdb227
 +    export_c_func!(CC_SHA256(_, _, _)),
 +];
 diff --git a/src/libc/cxxabi.rs b/src/libc/cxxabi.rs
-index ead0a6c..8c79ef1 100644
+index ead0a6c..540fb44 100644
 --- a/src/libc/cxxabi.rs
 +++ b/src/libc/cxxabi.rs
-@@ -34,7 +34,80 @@ fn __cxa_finalize(_env: &mut Environment, d: MutVoidPtr) {
+@@ -10,7 +10,7 @@
+ 
+ use crate::abi::GuestFunction;
+ use crate::dyld::{export_c_func, FunctionExports};
+-use crate::mem::MutVoidPtr;
++use crate::mem::{ConstVoidPtr, MutVoidPtr};
+ use crate::Environment;
+ 
+ fn __cxa_atexit(
+@@ -34,7 +34,170 @@ fn __cxa_finalize(_env: &mut Environment, d: MutVoidPtr) {
      log!("TODO: __cxa_finalize({:?}) (unimplemented)", d);
  }
  
@@ -1644,6 +1660,84 @@ index ead0a6c..8c79ef1 100644
 +fn __udivdi3(_env: &mut Environment, a: u64, b: u64) -> u64 {
 +    a / b
 +}
++// Division-with-remainder helpers (compiler-rt builtins).
++// `__divmodsi4(a, b, &rem)` returns the quotient `a / b` and stores the
++// remainder `a % b` through `rem`. Unsigned variant likewise.
++fn __divmodsi4(
++    env: &mut Environment,
++    a: i32,
++    b: i32,
++    rem: MutVoidPtr,
++) -> i32 {
++    let q = a / b;
++    let r = a % b;
++    env.mem.write(rem.cast::<i32>(), r);
++    q
++}
++fn __udivmodsi4(
++    env: &mut Environment,
++    a: u32,
++    b: u32,
++    rem: MutVoidPtr,
++) -> u32 {
++    let q = a / b;
++    let r = a % b;
++    env.mem.write(rem.cast::<u32>(), r);
++    q
++}
++// Float-to-integer conversion helpers (compiler-rt builtins).
++// `__fixdfdi(f)` converts double to int64, etc. Rust's `as` saturates on
++// overflow, which is acceptable (C leaves it undefined).
++fn __fixdfdi(_env: &mut Environment, a: f64) -> i64 {
++    a as i64
++}
++fn __fixsfdi(_env: &mut Environment, a: f32) -> i64 {
++    a as i64
++}
++fn __fixunsdfdi(_env: &mut Environment, a: f64) -> u64 {
++    a as u64
++}
++fn __fixunssfdi(_env: &mut Environment, a: f32) -> u64 {
++    a as u64
++}
++fn __fixdfsi(_env: &mut Environment, a: f64) -> i32 {
++    a as i32
++}
++fn __fixsfsi(_env: &mut Environment, a: f32) -> i32 {
++    a as i32
++}
++fn __fixunsdfsi(_env: &mut Environment, a: f64) -> u32 {
++    a as u32
++}
++fn __fixunssfsi(_env: &mut Environment, a: f32) -> u32 {
++    a as u32
++}
++// Stack protector failure: our `___stack_chk_guard` is a dummy constant that
++// is never validated, so this should never fire. Abort if it does.
++fn __stack_chk_fail(_env: &mut Environment) {
++    panic!("___stack_chk_fail called: stack smashing detected")
++}
++// Assertion failure: `__assert_rtn(func, file, line, expr)`.
++fn __assert_rtn(
++    env: &mut Environment,
++    func: ConstVoidPtr,
++    file: ConstVoidPtr,
++    line: i32,
++    expr: ConstVoidPtr,
++) {
++    let cstr = |p: ConstVoidPtr| {
++        let bytes = env.mem.bytes_at(p.cast(), 256u32);
++        let len = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
++        String::from_utf8_lossy(&bytes[..len]).into_owned()
++    };
++    panic!(
++        "Assertion failed: {} ({}:{} in {})",
++        cstr(expr),
++        cstr(file),
++        line,
++        cstr(func)
++    );
++}
 +// Integer to float conversion helpers
 +fn __floatdisf(_env: &mut Environment, a: i32) -> f32 {
 +    a as f32
@@ -1672,6 +1766,18 @@ index ead0a6c..8c79ef1 100644
 +    export_c_func!(__divdi3(_, _)),
 +    export_c_func!(__umoddi3(_, _)),
 +    export_c_func!(__udivdi3(_, _)),
++    export_c_func!(__divmodsi4(_, _, _)),
++    export_c_func!(__udivmodsi4(_, _, _)),
++    export_c_func!(__fixdfdi(_)),
++    export_c_func!(__fixsfdi(_)),
++    export_c_func!(__fixunsdfdi(_)),
++    export_c_func!(__fixunssfdi(_)),
++    export_c_func!(__fixdfsi(_)),
++    export_c_func!(__fixsfsi(_)),
++    export_c_func!(__fixunsdfsi(_)),
++    export_c_func!(__fixunssfsi(_)),
++    export_c_func!(__stack_chk_fail()),
++    export_c_func!(__assert_rtn(_, _, _, _)),
 +    export_c_func!(__floatdisf(_)),
 +    export_c_func!(__floatundisf(_)),
 +    export_c_func!(__floatdidf(_)),
