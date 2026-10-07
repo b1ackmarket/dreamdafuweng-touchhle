@@ -130,6 +130,11 @@ cp libtouchHLE.so libSDL2.so apk/lib/arm64-v8a/
 cp /path/to/libc++_shared.so apk/lib/arm64-v8a/
 # 游戏本体：必须叫这个名字，lib.rs 里写死了从 assets 读它
 cp /path/to/DreamDaFuWeng.ipa apk/assets/DreamDaFuWeng.ipa
+# 血泪教训2:touchHLE 自带的 dylibs/fonts/默认配置也必须进 assets,
+# 缺了启动时直接 panic("Unexpected I/O failure ... libsqlite3.dylib")。
+# 注意上游 android/app/src/main/assets 下这三个是软链接,要解引用复制:
+cp -rL <touchHLE>/touchHLE_dylibs <touchHLE>/touchHLE_fonts apk/assets/
+cp -L <touchHLE>/android/app/src/main/assets/touchHLE_default_options.txt apk/assets/
 cd apk && zip -qr ../unsigned.apk . -x 'assets/DreamDaFuWeng.ipa'
 # ipa 必须以 STORED（不压缩）方式加入：
 zip -qr ../unsigned.apk assets/DreamDaFuWeng.ipa -Z store
