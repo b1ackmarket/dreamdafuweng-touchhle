@@ -124,6 +124,10 @@ mkdir -p apk/lib/arm64-v8a apk/assets
 unzip -q -o base.apk -d apk
 cp dex/classes.dex apk/classes.dex
 cp libtouchHLE.so libSDL2.so apk/lib/arm64-v8a/
+# 血泪教训:libtouchHLE.so 的 NEEDED 里有 libc++_shared.so(NDK 自带),
+# 必须一起打进 apk/lib/arm64-v8a/,否则启动时 dlopen 直接失败秒崩。
+# 从 NDK 取:toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/aarch64-linux-android/libc++_shared.so
+cp /path/to/libc++_shared.so apk/lib/arm64-v8a/
 # 游戏本体：必须叫这个名字，lib.rs 里写死了从 assets 读它
 cp /path/to/DreamDaFuWeng.ipa apk/assets/DreamDaFuWeng.ipa
 cd apk && zip -qr ../unsigned.apk . -x 'assets/DreamDaFuWeng.ipa'
