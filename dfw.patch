@@ -1,0 +1,1787 @@
+diff --git a/Cargo.lock b/Cargo.lock
+index 8980d70..dca40f0 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -746,6 +746,17 @@ dependencies = [
+  "digest",
+ ]
+ 
++[[package]]
++name = "sha2"
++version = "0.10.9"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "a7507d819769d01a365ab707794a4084392c824f54a7a6a7862f8c3d0892b283"
++dependencies = [
++ "cfg-if",
++ "cpufeatures",
++ "digest",
++]
++
+ [[package]]
+ name = "smallvec"
+ version = "1.15.1"
+@@ -1024,6 +1035,7 @@ dependencies = [
+  "sdl2",
+  "sdl2-sys",
+  "sha1",
++ "sha2",
+  "symphonia",
+  "touchHLE_dynarmic_wrapper",
+  "touchHLE_gl_bindings",
+diff --git a/Cargo.toml b/Cargo.toml
+index 7243a14..4849f52 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -61,6 +61,7 @@ quick-xml = "0.38.4"
+ digest = "0.10.7"
+ md-5 = "0.10.6"
+ sha1 = "0.10.6"
++sha2 = "0.10.8"
+ encoding_rs = "0.8.35"
+ # We currently use a fork of rust-sdl2 because we need a fix for Android builds
+ # that's not upstream yet.
+diff --git a/android/app/build.gradle.kts b/android/app/build.gradle.kts
+index ad7376c..f7d2e9d 100644
+--- a/android/app/build.gradle.kts
++++ b/android/app/build.gradle.kts
+@@ -45,12 +45,12 @@ android {
+     }
+     defaultConfig {
+         val branding = getTouchHLEBranding()
+-        applicationId = "org.touchhle.android"
++        applicationId = "org.touchhle.dreamdafuweng"
+         if (!branding.isEmpty()) {
+             applicationIdSuffix = branding.lowercase()
+         }
+-        resValue("string", "app_name", join("touchHLE", " ", branding))
+-        buildConfigField("String", "APP_NAME", "\"${join("touchHLE", " ", branding)}\"")
++        resValue("string", "app_name", "梦幻富翁")
++        buildConfigField("String", "APP_NAME", "\"梦幻富翁\"")
+         manifestPlaceholders["icon"] = join("@drawable/icon", "_", branding.lowercase())
+         buildConfigField("int", "APP_ICON", join("R.drawable.icon", "_", branding.lowercase()))
+         versionName = join(getTouchHLEVersionName(), " ", branding)
+@@ -80,6 +80,9 @@ android {
+     kotlinOptions {
+         jvmTarget = "11"
+     }
++    aaptOptions {
++        noCompress("ipa")
++    }
+     buildTypes {
+         release {
+             signingConfig = signingConfigs.getByName("debug")
+@@ -127,7 +130,7 @@ android {
+     lint {
+         abortOnError = false
+     }
+-    namespace = "org.touchhle.android"
++    namespace = "org.touchhle.dreamdafuweng"
+ }
+ 
+ cargoNdk {
+diff --git a/src/dyld.rs b/src/dyld.rs
+index 71b8d00..ba93960 100644
+--- a/src/dyld.rs
++++ b/src/dyld.rs
+@@ -511,9 +511,14 @@ impl Dyld {
+                     trampoline_ptr
+                 );
+                 trampoline_ptr
+-            } else if search_host_dylibs(|dylib| dylib.constant_exports, name).is_some() {
+-                // Skip the constants from DYLD_INFO because we already
+-                // handle the consts when reading the __nl_symbol_ptr section
++            } else if let Some((_, template)) =
++                search_host_dylibs(|dylib| dylib.constant_exports, name)
++            {
++                // Constants in external relocations (e.g. block isa pointers
++                // like `__NSConcreteStackBlock` in __data) need to be linked
++                // too, not just those in __nl_symbol_ptr. Delay linking until
++                // we have a `&mut Environment`.
++                self.constants_to_link_later.push((ptr_ptr, template));
+                 continue;
+             } else {
+                 unhandled_relocations
+diff --git a/src/frameworks/core_foundation.rs b/src/frameworks/core_foundation.rs
+index 205be44..95806b6 100644
+--- a/src/frameworks/core_foundation.rs
++++ b/src/frameworks/core_foundation.rs
+@@ -37,6 +37,7 @@ pub const DYLIB: crate::dyld::HostDylib = crate::dyld::HostDylib {
+     path: "/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation",
+     aliases: &[],
+     class_exports: &[
++        cf_run_loop::CLASSES,
+         cf_run_loop_timer::CLASSES, // Special internal classes.
+         cf_uuid::CLASSES,
+     ],
+diff --git a/src/frameworks/core_foundation/cf_run_loop.rs b/src/frameworks/core_foundation/cf_run_loop.rs
+index f73f171..f8ce323 100644
+--- a/src/frameworks/core_foundation/cf_run_loop.rs
++++ b/src/frameworks/core_foundation/cf_run_loop.rs
+@@ -12,8 +12,10 @@ use crate::dyld::{export_c_func, ConstantExports, FunctionExports, HostConstant}
+ use crate::frameworks::core_foundation::time::CFTimeInterval;
+ use crate::frameworks::foundation::ns_run_loop::run_run_loop_single_iteration;
+ use crate::frameworks::foundation::ns_string;
+-use crate::objc::{id, msg, msg_class};
++use crate::mem::{ConstVoidPtr, MutVoidPtr};
++use crate::objc::{id, msg, msg_class, objc_classes, ClassExports, HostObject};
+ use crate::Environment;
++use super::cf_allocator::{kCFAllocatorDefault, CFAllocatorRef};
+ 
+ pub type CFRunLoopRef = super::CFTypeRef;
+ pub type CFRunLoopMode = super::cf_string::CFStringRef;
+@@ -63,8 +65,60 @@ pub const CONSTANTS: ConstantExports = &[
+     ),
+ ];
+ 
++pub const CLASSES: ClassExports = objc_classes! {
++
++(env, this, _cmd);
++
++@implementation _touchHLE_CFRunLoopSource: NSObject
++@end
++
++};
++
++type CFRunLoopSourceRef = super::CFTypeRef;
++
++struct CFRunLoopSourceHostObject {}
++impl HostObject for CFRunLoopSourceHostObject {}
++
++fn CFRunLoopSourceCreate(
++    env: &mut Environment,
++    _allocator: CFAllocatorRef,
++    order: i32,
++    context: ConstVoidPtr,
++) -> CFRunLoopSourceRef {
++    log!("TODO: CFRunLoopSourceCreate(order={}, context={:?}) (stub)", order, context);
++    let host_obj = Box::new(CFRunLoopSourceHostObject {});
++    let class = env.objc.get_known_class("_touchHLE_CFRunLoopSource", &mut env.mem);
++    env.objc.alloc_object(class, host_obj, &mut env.mem)
++}
++
++fn CFRunLoopAddSource(
++    env: &mut Environment,
++    _rl: CFRunLoopRef,
++    _source: CFRunLoopSourceRef,
++    _mode: CFRunLoopMode,
++) {
++    log!("TODO: CFRunLoopAddSource() (stub)");
++}
++
++fn CFRunLoopSourceInvalidate(env: &mut Environment, _source: CFRunLoopSourceRef) {
++    log!("TODO: CFRunLoopSourceInvalidate() (stub)");
++}
++
++fn CFRunLoopRemoveSource(
++    env: &mut Environment,
++    _rl: CFRunLoopRef,
++    _source: CFRunLoopSourceRef,
++    _mode: CFRunLoopMode,
++) {
++    log!("TODO: CFRunLoopRemoveSource() (stub)");
++}
++
+ pub const FUNCTIONS: FunctionExports = &[
+     export_c_func!(CFRunLoopGetCurrent()),
+     export_c_func!(CFRunLoopGetMain()),
+     export_c_func!(CFRunLoopRunInMode(_, _, _)),
++    export_c_func!(CFRunLoopSourceCreate(_, _, _)),
++    export_c_func!(CFRunLoopAddSource(_, _, _)),
++    export_c_func!(CFRunLoopSourceInvalidate(_)),
++    export_c_func!(CFRunLoopRemoveSource(_, _, _)),
+ ];
+diff --git a/src/frameworks/core_foundation/cf_uuid.rs b/src/frameworks/core_foundation/cf_uuid.rs
+index 5ece4ff..a6706d3 100644
+--- a/src/frameworks/core_foundation/cf_uuid.rs
++++ b/src/frameworks/core_foundation/cf_uuid.rs
+@@ -56,7 +56,47 @@ fn CFUUIDCreateString(
+     from_rust_string(env, uuid_str)
+ }
+ 
++// CFUUIDBytes is a 16-byte struct returned by value.
++// On ARM, it's returned in r0-r3. We model it as a 16-byte array.
++// The export_c_func! macro needs to handle struct returns; for simplicity,
++// we return the bytes via a guest-allocated buffer? No - we need to return
++// by value. Let's use a custom approach: the function returns a u64 pair?
++// Actually, for ARM, a 16-byte struct is returned in r0-r3 (4 words).
++// We'll define the function to return [u8; 16] and hope the ABI works.
++// Simpler: return the UUID bytes as two u64s? No.
++//
++// The cleanest: use the `export_c_func!` with a return type that the
++// calling convention handles. For a 16-byte struct, Rust's [u8; 16]
++// should map correctly to r0-r3 on ARM.
++
++fn CFUUIDGetUUIDBytes(env: &mut Environment, uuid: CFUUIDRef) -> [u8; 16] {
++    let host_object = env.objc.borrow::<CFUUIDHostObject>(uuid);
++    *host_object.uuid.as_bytes()
++}
++
++// CFUUIDBytes (16 bytes) is returned in r0-r3 on ARM.
++impl crate::abi::GuestRet for [u8; 16] {
++    fn from_regs(regs: &[u32]) -> Self {
++        let mut bytes = [0u8; 16];
++        for i in 0..4 {
++            bytes[i * 4..(i + 1) * 4].copy_from_slice(&regs[i].to_le_bytes());
++        }
++        bytes
++    }
++    fn to_regs(self, regs: &mut [u32]) {
++        for i in 0..4 {
++            regs[i] = u32::from_le_bytes([
++                self[i * 4],
++                self[i * 4 + 1],
++                self[i * 4 + 2],
++                self[i * 4 + 3],
++            ]);
++        }
++    }
++}
++
+ pub const FUNCTIONS: FunctionExports = &[
+     export_c_func!(CFUUIDCreate(_)),
+     export_c_func!(CFUUIDCreateString(_, _)),
++    export_c_func!(CFUUIDGetUUIDBytes(_)),
+ ];
+diff --git a/src/frameworks/foundation.rs b/src/frameworks/foundation.rs
+index 441c507..22fc885 100644
+--- a/src/frameworks/foundation.rs
++++ b/src/frameworks/foundation.rs
+@@ -18,6 +18,7 @@ use crate::Environment;
+ pub mod _nib_archive_decoder;
+ pub mod ns_array;
+ pub mod ns_autorelease_pool;
++pub mod ns_block;
+ pub mod ns_bundle;
+ pub mod ns_character_set;
+ pub mod ns_coder;
+@@ -44,6 +45,7 @@ pub mod ns_notification_center;
+ pub mod ns_null;
+ pub mod ns_objc_runtime;
+ pub mod ns_object;
++pub mod ns_operation_queue;
+ pub mod ns_process_info;
+ pub mod ns_property_list_serialization;
+ pub mod ns_run_loop;
+@@ -67,6 +69,7 @@ pub const DYLIB: crate::dyld::HostDylib = crate::dyld::HostDylib {
+         _nib_archive_decoder::CLASSES,
+         ns_array::CLASSES,
+         ns_autorelease_pool::CLASSES,
++        ns_block::CLASSES,
+         ns_bundle::CLASSES,
+         ns_character_set::CLASSES,
+         ns_coder::CLASSES,
+@@ -90,6 +93,7 @@ pub const DYLIB: crate::dyld::HostDylib = crate::dyld::HostDylib {
+         ns_null::CLASSES,
+         ns_method_signature::CLASSES,
+         ns_object::CLASSES,
++        ns_operation_queue::CLASSES,
+         ns_process_info::CLASSES,
+         ns_property_list_serialization::CLASSES,
+         ns_run_loop::CLASSES,
+@@ -130,6 +134,7 @@ pub struct State {
+     ns_locale: ns_locale::State,
+     ns_notification_center: ns_notification_center::State,
+     ns_null: ns_null::State,
++    ns_operation_queue: ns_operation_queue::State,
+     ns_process_info: ns_process_info::State,
+     ns_string: ns_string::State,
+     ns_thread: ns_thread::State,
+diff --git a/src/frameworks/foundation/ns_block.rs b/src/frameworks/foundation/ns_block.rs
+new file mode 100644
+index 0000000..71de99f
+--- /dev/null
++++ b/src/frameworks/foundation/ns_block.rs
+@@ -0,0 +1,53 @@
++/*
++ * This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at https://mozilla.org/MPL/2.0/.
++ */
++//! Block classes (`_NSConcreteStackBlock`, etc.).
++//!
++//! These are the isa classes for Objective-C block literals. They need to
++//! exist so that blocks are valid objects (e.g. can receive `retain`).
++//! Blocks are created by the compiler as literals, never via `alloc`, so no
++//! allocation methods are needed; everything else is inherited from
++//! `NSObject`, except memory management which is a no-op: we execute blocks
++//! synchronously, so stack blocks stay valid for the duration of use, and
++//! global blocks are immortal anyway.
++
++use crate::objc::{id, objc_classes, ClassExports};
++use crate::Environment;
++
++pub const CLASSES: ClassExports = objc_classes! {
++
++(env, this, _cmd);
++
++@implementation NSBlock: NSObject
++
++- (id)retain {
++    // No-op: blocks are not tracked in the host object map.
++    // Stack blocks are valid for the synchronous duration of use;
++    // global blocks are immortal.
++    this
++}
++- (())release {
++    // No-op (see above).
++}
++- (id)autorelease {
++    this
++}
++- (id)copy {
++    // For our synchronous use, retaining (no-op) is sufficient.
++    this
++}
++
++@end
++
++@implementation _NSConcreteStackBlock: NSBlock
++@end
++
++@implementation _NSConcreteGlobalBlock: NSBlock
++@end
++
++@implementation _NSConcreteMallocBlock: NSBlock
++@end
++
++};
+diff --git a/src/frameworks/foundation/ns_date.rs b/src/frameworks/foundation/ns_date.rs
+index 160378a..c749607 100644
+--- a/src/frameworks/foundation/ns_date.rs
++++ b/src/frameworks/foundation/ns_date.rs
+@@ -194,6 +194,13 @@ pub const CLASSES: ClassExports = objc_classes! {
+     date
+ }
+ 
++- (id)dateByAddingTimeInterval:(NSTimeInterval)seconds {
++    // Returns a new date, does not mutate the receiver.
++    let interval = env.objc.borrow::<NSDateHostObject>(this).time_interval + seconds;
++    let date: id = msg_class![env; NSDate dateWithTimeIntervalSince1970:interval];
++    date
++}
++
+ - (NSComparisonResult)compare:(id)anotherDate { // NSDate *
+     let host_object = env.objc.borrow::<NSDateHostObject>(this);
+     let another_date_host_object = env.objc.borrow::<NSDateHostObject>(anotherDate);
+diff --git a/src/frameworks/foundation/ns_notification_center.rs b/src/frameworks/foundation/ns_notification_center.rs
+index be048ca..fb570b8 100644
+--- a/src/frameworks/foundation/ns_notification_center.rs
++++ b/src/frameworks/foundation/ns_notification_center.rs
+@@ -6,6 +6,7 @@
+ //! `NSNotificationCenter`.
+ 
+ use super::ns_notification::NSNotificationName;
++use super::ns_operation_queue::invoke_block_with_arg;
+ use super::ns_string;
+ 
+ use crate::objc::{
+@@ -20,13 +21,33 @@ pub struct State {
+     default_center: Option<id>,
+ }
+ 
++#[derive(Clone)]
++enum ObserverKind {
++    /// Classic observer. `observer` is NOT retained (avoids retain cycles,
++    /// matching Apple's documented behavior).
++    Selector { observer: id, selector: SEL },
++    /// Block-based observer from `addObserverForName:object:queue:usingBlock:`.
++    /// Both the opaque `token` and the `block` are retained by the center.
++    Block { token: id, block: id },
++}
++
+ #[derive(Clone)]
+ struct Observer {
+-    observer: id,
+-    selector: SEL,
++    kind: ObserverKind,
++    /// Filter for notification sources; retained.
+     object: id,
+ }
+ 
++impl Observer {
++    /// Identity used by `removeObserver:`.
++    fn observer_id(&self) -> id {
++        match self.kind {
++            ObserverKind::Selector { observer, .. } => observer,
++            ObserverKind::Block { token, .. } => token,
++        }
++    }
++}
++
+ struct NSNotificationCenterHostObject {
+     observers: HashMap<Option<Cow<'static, str>>, Vec<Observer>>,
+ }
+@@ -60,6 +81,10 @@ pub const CLASSES: ClassExports = objc_classes! {
+     let observers = std::mem::take(&mut host_obj.observers);
+     for observer in observers.values().flatten() {
+         release(env, observer.object);
++        if let ObserverKind::Block { token, block } = observer.kind {
++            release(env, token);
++            release(env, block);
++        }
+     }
+     env.objc.dealloc_object(this, &mut env.mem);
+ }
+@@ -105,12 +130,51 @@ pub const CLASSES: ClassExports = objc_classes! {
+ 
+     let host_obj = env.objc.borrow_mut::<NSNotificationCenterHostObject>(this);
+     host_obj.observers.entry(name).or_default().push(Observer {
+-        observer,
+-        selector,
++        kind: ObserverKind::Selector { observer, selector },
+         object,
+     });
+ }
+ 
++- (id)addObserverForName:(NSNotificationName)name
++                  object:(id)object
++                   queue:(id)queue // NSOperationQueue *, may be nil
++              usingBlock:(id)block { // void (^)(NSNotification *)
++    assert!(block != nil);
++    let name = if name != nil {
++        Some(ns_string::to_rust_string(env, name))
++    } else {
++        None
++    };
++
++    log!(
++        "[(NSNotificationCenter*){:?} addObserverForName:{:?} object:{:?} queue:{:?} usingBlock:{:?}]",
++        this,
++        name,
++        object,
++        queue,
++        block,
++    );
++
++    // The center retains the block until the observer is removed. We execute
++    // blocks synchronously on the posting thread, so a retain is sufficient
++    // (no heap copy needed); the `queue` parameter is accepted but the block
++    // runs inline, which is observationally equivalent for synchronous queues.
++    let _ = queue;
++    retain(env, block);
++    retain(env, object);
++
++    // Opaque token acting as the observer, as documented. Retained by us.
++    let token: id = msg_class![env; NSObject new];
++    retain(env, token);
++
++    let host_obj = env.objc.borrow_mut::<NSNotificationCenterHostObject>(this);
++    host_obj.observers.entry(name).or_default().push(Observer {
++        kind: ObserverKind::Block { token, block },
++        object,
++    });
++    token
++}
++
+ - (())removeObserver:(id)observer {
+     msg![env; this removeObserver:observer name:nil object:nil]
+ }
+@@ -153,6 +217,10 @@ pub const CLASSES: ClassExports = objc_classes! {
+ 
+     for removed_observer in removed_observers {
+         release(env, removed_observer.object);
++        if let ObserverKind::Block { token, block } = removed_observer.kind {
++            release(env, token);
++            release(env, block);
++        }
+     }
+ }
+ 
+@@ -176,28 +244,50 @@ pub const CLASSES: ClassExports = objc_classes! {
+     if let Some(nameless_observers) = host_obj.observers.get(&None) {
+         observers.extend(nameless_observers.iter().cloned());
+     }
+-    for Observer { observer, selector, object } in observers {
++    for Observer { kind, object } in observers {
+         // The object argument is a filter for which notification sources the
+         // observer is interested in.
+         if object != nil && notification_poster != object {
+             continue;
+         }
+ 
+-        log_dbg!(
+-            "Notification {:?} observed, sending {:?} message to {:?}",
+-            notification,
+-            selector.as_str(&env.mem),
+-            observer
+-        );
+-
+-        // In some cases, observer could be removed during the
+-        // processing of the notification, effectively releasing it.
+-        // (This is happening with Spore Origins)
+-        // We need to retain it for correctness.
+-        retain(env, observer);
+-        // Signature should be `- (void)notification:(NSNotification *)notif`.
+-        let _: () = msg_send(env, (observer, selector, notification));
+-        release(env, observer);
++        match kind {
++            ObserverKind::Selector { observer, selector } => {
++                log_dbg!(
++                    "Notification {:?} observed, sending {:?} message to {:?}",
++                    notification,
++                    selector.as_str(&env.mem),
++                    observer
++                );
++
++                // In some cases, observer could be removed during the
++                // processing of the notification, effectively releasing it.
++                // (This is happening with Spore Origins)
++                // We need to retain it for correctness.
++                retain(env, observer);
++                // Signature should be `- (void)notification:(NSNotification *)notif`.
++                let _: () = msg_send(env, (observer, selector, notification));
++                release(env, observer);
++            }
++            ObserverKind::Block { block, .. } => {
++                log_dbg!(
++                    "Notification {:?} observed, invoking block {:?}",
++                    notification,
++                    block
++                );
++                // The block is retained by the center for as long as the
++                // observer is registered; retain across the call in case it
++                // is removed during delivery.
++                retain(env, block);
++                // Block signature: void (^)(NSNotification *).
++                // invoke_block passes the block itself in r0; we need the
++                // notification as the block's argument instead. Blocks take
++                // their captured block pointer as the implicit first arg,
++                // followed by declared parameters.
++                invoke_block_with_arg(env, block, notification);
++                release(env, block);
++            }
++        }
+     }
+ }
+ - (())postNotificationName:(NSNotificationName)name
+@@ -231,7 +321,9 @@ fn remove_observers_internal(
+ ) {
+     let mut i = 0;
+     while i < observers.len() {
+-        if observers[i].observer == observer && (object == nil || object == observers[i].object) {
++        if observers[i].observer_id() == observer
++            && (object == nil || object == observers[i].object)
++        {
+             removed_observers.push(observers.swap_remove(i));
+         } else {
+             i += 1;
+diff --git a/src/frameworks/foundation/ns_object.rs b/src/frameworks/foundation/ns_object.rs
+index 6e160fa..903dda9 100644
+--- a/src/frameworks/foundation/ns_object.rs
++++ b/src/frameworks/foundation/ns_object.rs
+@@ -75,6 +75,11 @@ pub const CLASSES: ClassExports = objc_classes! {
+     true
+ }
+ 
+++ (id)methodForSelector:(SEL)selector {
++    log!("TODO: [{} methodForSelector:{}] (returning null)", env.objc.get_class_name(this), selector.as_str(&env.mem));
++    nil
++}
++
+ + (id)description {
+     let name = env.objc.get_class_name(this);
+     let str = from_rust_string(env, name.to_string());
+@@ -119,6 +124,11 @@ pub const CLASSES: ClassExports = objc_classes! {
+     () = msg_class![env; NSAutoreleasePool addObject:this];
+     this
+ }
++- (id)methodForSelector:(SEL)selector {
++    let class: id = msg![env; this class];
++    log!("TODO: [{} methodForSelector:{}] (returning null)", env.objc.get_class_name(class), selector.as_str(&env.mem));
++    nil
++}
+ 
+ - (())dealloc {
+     log_dbg!("[{:?} dealloc]", this);
+@@ -270,6 +280,17 @@ forUndefinedKey:(id)key { // NSString*
+     msg_send_no_type_checking(env, (this, sel, o1, o2))
+ }
+ 
++- (id)performSelector:(SEL)sel
++           onThread:(id)thread
++         withObject:(id)arg
++      waitUntilDone:(bool)wait {
++    // Simplified: ignore the thread parameter and perform immediately.
++    // A proper implementation would dispatch to the specified thread.
++    log!("TODO: [performSelector:onThread:withObject:waitUntilDone:] ignoring thread, performing directly");
++    assert!(!sel.is_null());
++    msg_send_no_type_checking(env, (this, sel, arg))
++}
++
+ - (())performSelectorInBackground:(SEL)sel
+                        withObject:(id)arg {
+     detach_new_thread_inner(env, sel, this, arg, /* tolerate_type_mismatch: */ true)
+diff --git a/src/frameworks/foundation/ns_operation_queue.rs b/src/frameworks/foundation/ns_operation_queue.rs
+new file mode 100644
+index 0000000..9384b17
+--- /dev/null
++++ b/src/frameworks/foundation/ns_operation_queue.rs
+@@ -0,0 +1,501 @@
++/*
++ * This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at https://mozilla.org/MPL/2.0/.
++ */
++//! `NSOperation`, `NSBlockOperation`, `NSInvocationOperation`,
++//! `NSOperationQueue`.
++//!
++//! Minimal implementation: operations run synchronously on the calling
++//! thread. This is sufficient for games/SDKs that use operation queues for
++//! background housekeeping (analytics, update checks).
++
++use crate::abi::GuestFunction;
++use crate::mem::{ConstPtr, Mem};
++use crate::objc::{
++    id, msg, msg_class, msg_send, nil, objc_classes, release, retain, ClassExports, HostObject,
++    NSZonePtr, SEL,
++};
++use crate::Environment;
++
++#[derive(Default)]
++pub struct State {
++    main_queue: id,
++}
++impl State {
++    fn get(env: &mut Environment) -> &mut Self {
++        &mut env.framework_state.foundation.ns_operation_queue
++    }
++}
++
++/// Invoke a guest block: read `invoke` from the block literal and call it
++/// with the block itself as the sole argument.
++pub(crate) fn invoke_block(env: &mut Environment, block: id) {
++    invoke_block_with_arg(env, block, block);
++}
++
++/// Read a little-endian u32 at a byte offset from a pointer.
++pub(crate) fn read_u32_at_byte_offset(env: &Environment, base: id, byte_offset: u32) -> u32 {
++    let byte_ptr = base.cast_const().cast::<u8>();
++    let target: ConstPtr<u32> = (byte_ptr + byte_offset).cast();
++    env.mem.read(target)
++}
++
++/// Invoke a guest block with one explicit argument (after the implicit block
++/// pointer in r0).
++pub(crate) fn invoke_block_with_arg(env: &mut Environment, block: id, arg: id) {
++    assert!(block != nil);
++    // Block literal layout (32-bit): isa(0), flags(4), reserved(8),
++    // invoke(12), descriptor(16)
++    let invoke_addr = read_u32_at_byte_offset(env, block, 12);
++    assert!(invoke_addr != 0);
++    log!(
++        "Invoking guest block {:?} (invoke at {:#x}) with arg {:?}",
++        block,
++        invoke_addr,
++        arg,
++    );
++    let guest_fn = GuestFunction::from_addr_with_thumb_bit(invoke_addr);
++    env.cpu.regs_mut()[0] = block.to_bits();
++    env.cpu.regs_mut()[1] = arg.to_bits();
++    guest_fn.call_without_pushing_stack_frame(env);
++}
++
++#[derive(Default)]
++struct OperationBase {
++    cancelled: bool,
++    executing: bool,
++    finished: bool,
++    /// `NSMutableArray*` of dependencies (retained, bookkeeping only)
++    dependencies: id,
++}
++
++enum OperationKind {
++    Base,
++    Block {
++        /// `NSMutableArray*` of block objects (`id`)
++        execution_blocks: id,
++    },
++    Invocation {
++        target: id,
++        selector: Option<SEL>,
++        object: id,
++    },
++}
++
++struct NSOperationHostObject {
++    base: OperationBase,
++    kind: OperationKind,
++}
++impl HostObject for NSOperationHostObject {}
++
++impl NSOperationHostObject {
++    fn base_new(kind: OperationKind) -> Self {
++        NSOperationHostObject {
++            base: OperationBase {
++                dependencies: nil,
++                ..Default::default()
++            },
++            kind,
++        }
++    }
++}
++
++struct NSOperationQueueHostObject {
++    /// `NSMutableArray*` of operations (bookkeeping only; we run synchronously)
++    operations: id,
++    max_concurrent: i32,
++    suspended: bool,
++    name: id,
++}
++impl HostObject for NSOperationQueueHostObject {}
++
++pub const CLASSES: ClassExports = objc_classes! {
++
++(env, this, _cmd);
++
++@implementation NSOperation: NSObject
++
+++ (id)allocWithZone:(NSZonePtr)_zone {
++    let host_object = Box::new(NSOperationHostObject::base_new(OperationKind::Base));
++    env.objc.alloc_object(this, host_object, &mut env.mem)
++}
++
++- (id)init {
++    this
++}
++
++- (())start {
++    // Synchronous execution: run main() immediately unless cancelled.
++    let cancelled = env.objc.borrow::<NSOperationHostObject>(this).base.cancelled;
++    if !cancelled {
++        env.objc.borrow_mut::<NSOperationHostObject>(this).base.executing = true;
++        () = msg![env; this main];
++        let base = &mut env.objc.borrow_mut::<NSOperationHostObject>(this).base;
++        base.executing = false;
++        base.finished = true;
++    } else {
++        env.objc.borrow_mut::<NSOperationHostObject>(this).base.finished = true;
++    }
++}
++
++- (())main {
++    // Default implementation does nothing; subclasses override.
++}
++
++- (bool)isCancelled {
++    env.objc.borrow::<NSOperationHostObject>(this).base.cancelled
++}
++- (())cancel {
++    env.objc.borrow_mut::<NSOperationHostObject>(this).base.cancelled = true;
++}
++- (bool)isExecuting {
++    env.objc.borrow::<NSOperationHostObject>(this).base.executing
++}
++- (bool)isFinished {
++    env.objc.borrow::<NSOperationHostObject>(this).base.finished
++}
++- (bool)isConcurrent {
++    // We always run operations synchronously.
++    false
++}
++- (bool)isAsynchronous {
++    false
++}
++- (bool)isReady {
++    // Dependencies are ignored; always ready.
++    true
++}
++- (())addDependency:(id)op {
++    retain(env, op);
++    let deps = env.objc.borrow::<NSOperationHostObject>(this).base.dependencies;
++    let deps = if deps == nil {
++        let arr: id = msg_class![env; NSMutableArray new];
++        env.objc.borrow_mut::<NSOperationHostObject>(this).base.dependencies = arr;
++        arr
++    } else {
++        deps
++    };
++    () = msg![env; deps addObject:op];
++}
++- (())removeDependency:(id)op {
++    let deps = env.objc.borrow::<NSOperationHostObject>(this).base.dependencies;
++    if deps != nil {
++        () = msg![env; deps removeObject:op];
++    }
++    release(env, op);
++}
++- (id)dependencies {
++    let deps = env.objc.borrow::<NSOperationHostObject>(this).base.dependencies;
++    if deps == nil {
++        msg_class![env; NSArray new]
++    } else {
++        msg![env; deps copy]
++    }
++}
++- (())waitUntilFinished {
++    // Synchronous execution: already finished by the time start returns.
++}
++- (f64)threadPriority {
++    0.5
++}
++- (())setThreadPriority:(f64)_priority {
++}
++- (i32)queuePriority {
++    0 // NSOperationQueuePriorityNormal
++}
++- (())setQueuePriority:(i32)_priority {
++}
++
++- (())dealloc {
++    let deps = env.objc.borrow::<NSOperationHostObject>(this).base.dependencies;
++    release(env, deps);
++    // Kind-specific cleanup is handled by subclass dealloc.
++    env.objc.dealloc_object(this, &mut env.mem)
++}
++
++@end
++
++@implementation NSBlockOperation: NSOperation
++
+++ (id)allocWithZone:(NSZonePtr)_zone {
++    let host_object = Box::new(NSOperationHostObject::base_new(OperationKind::Block {
++        execution_blocks: nil,
++    }));
++    env.objc.alloc_object(this, host_object, &mut env.mem)
++}
++
+++ (id)blockOperationWithBlock:(id)block {
++    let op: id = msg_class![env; NSBlockOperation alloc];
++    let op: id = msg![env; op init];
++    () = msg![env; op addExecutionBlock:block];
++    op
++}
++
++- (id)init {
++    let blocks: id = msg_class![env; NSMutableArray new];
++    let host_obj = env.objc.borrow_mut::<NSOperationHostObject>(this);
++    match &mut host_obj.kind {
++        OperationKind::Block { execution_blocks } => *execution_blocks = blocks,
++        _ => panic!("NSBlockOperation init on non-block operation"),
++    }
++    this
++}
++
++- (id)executionBlocks {
++    let blocks = {
++        let host_obj = env.objc.borrow::<NSOperationHostObject>(this);
++        match &host_obj.kind {
++            OperationKind::Block { execution_blocks } => *execution_blocks,
++            _ => panic!("executionBlocks on non-block operation"),
++        }
++    };
++    msg![env; blocks copy]
++}
++
++- (())addExecutionBlock:(id)block {
++    assert!(block != nil);
++    // We execute synchronously and immediately, so the (possibly stack)
++    // block is still valid; a retain is enough, no _Block_copy needed.
++    retain(env, block);
++    let host_obj = env.objc.borrow::<NSOperationHostObject>(this);
++    let blocks = match &host_obj.kind {
++        OperationKind::Block { execution_blocks } => *execution_blocks,
++        _ => panic!("addExecutionBlock: on non-block operation"),
++    };
++    assert!(blocks != nil);
++    () = msg![env; blocks addObject:block];
++}
++
++- (())main {
++    let blocks = {
++        let host_obj = env.objc.borrow::<NSOperationHostObject>(this);
++        match &host_obj.kind {
++            OperationKind::Block { execution_blocks } => *execution_blocks,
++            _ => panic!("NSBlockOperation main on non-block operation"),
++        }
++    };
++    assert!(blocks != nil);
++    let count: u32 = msg![env; blocks count];
++    for i in 0..count {
++        let block: id = msg![env; blocks objectAtIndex:i];
++        invoke_block(env, block);
++    }
++}
++
++- (())dealloc {
++    let blocks = {
++        let host_obj = env.objc.borrow::<NSOperationHostObject>(this);
++        match &host_obj.kind {
++            OperationKind::Block { execution_blocks } => *execution_blocks,
++            _ => nil,
++        }
++    };
++    release(env, blocks);
++    let deps = env.objc.borrow::<NSOperationHostObject>(this).base.dependencies;
++    release(env, deps);
++    env.objc.dealloc_object(this, &mut env.mem)
++}
++
++@end
++
++@implementation NSInvocationOperation: NSOperation
++
+++ (id)allocWithZone:(NSZonePtr)_zone {
++    let host_object = Box::new(NSOperationHostObject::base_new(OperationKind::Invocation {
++        target: nil,
++        selector: None,
++        object: nil,
++    }));
++    env.objc.alloc_object(this, host_object, &mut env.mem)
++}
++
++- (id)initWithTarget:(id)target selector:(SEL)selector object:(id)object {
++    retain(env, target);
++    retain(env, object);
++    let host_obj = env.objc.borrow_mut::<NSOperationHostObject>(this);
++    match &mut host_obj.kind {
++        OperationKind::Invocation {
++            target: t,
++            selector: s,
++            object: o,
++        } => {
++            *t = target;
++            *s = Some(selector);
++            *o = object;
++        }
++        _ => panic!("initWithTarget: on non-invocation operation"),
++    }
++    this
++}
++- (id)initWithInvocation:(id)_inv { // NSInvocation *
++    log!("TODO: [NSInvocationOperation initWithInvocation:] not implemented, returning bare operation");
++    this
++}
++- (id)target {
++    let host_obj = env.objc.borrow::<NSOperationHostObject>(this);
++    match &host_obj.kind {
++        OperationKind::Invocation { target, .. } => *target,
++        _ => nil,
++    }
++}
++
++- (())main {
++    let (target, selector, object) = {
++        let host_obj = env.objc.borrow::<NSOperationHostObject>(this);
++        match &host_obj.kind {
++            OperationKind::Invocation {
++                target,
++                selector,
++                object,
++            } => (*target, *selector, *object),
++            _ => (nil, None, nil),
++        }
++    };
++    if let Some(selector) = selector {
++        msg_send::<(), _>(env, (target, selector, object));
++    }
++}
++
++- (())dealloc {
++    let (target, object) = {
++        let host_obj = env.objc.borrow::<NSOperationHostObject>(this);
++        match &host_obj.kind {
++            OperationKind::Invocation { target, object, .. } => (*target, *object),
++            _ => (nil, nil),
++        }
++    };
++    release(env, target);
++    release(env, object);
++    let deps = env.objc.borrow::<NSOperationHostObject>(this).base.dependencies;
++    release(env, deps);
++    env.objc.dealloc_object(this, &mut env.mem)
++}
++
++@end
++
++@implementation NSOperationQueue: NSObject
++
+++ (id)allocWithZone:(NSZonePtr)_zone {
++    let host_object = Box::new(NSOperationQueueHostObject {
++        operations: nil,
++        max_concurrent: -1, // NSOperationQueueDefaultMaxConcurrentOperationCount
++        suspended: false,
++        name: nil,
++    });
++    env.objc.alloc_object(this, host_object, &mut env.mem)
++}
++
+++ (id)mainQueue {
++    let main_queue = State::get(env).main_queue;
++    if main_queue == nil {
++        let queue: id = msg_class![env; NSOperationQueue alloc];
++        let queue: id = msg![env; queue init];
++        State::get(env).main_queue = queue;
++        queue
++    } else {
++        main_queue
++    }
++}
++
+++ (id)currentQueue {
++    // We run everything synchronously, so the "current" queue is ambiguous;
++    // return the main queue.
++    msg_class![env; NSOperationQueue mainQueue]
++}
++
++- (id)init {
++    let ops: id = msg_class![env; NSMutableArray new];
++    env.objc.borrow_mut::<NSOperationQueueHostObject>(this).operations = ops;
++    this
++}
++
++- (())addOperation:(id)op {
++    assert!(op != nil);
++    log_dbg!("[NSOperationQueue addOperation:{:?}] (executing synchronously)", op);
++    let ops = env.objc.borrow::<NSOperationQueueHostObject>(this).operations;
++    if ops != nil {
++        retain(env, op);
++        () = msg![env; ops addObject:op];
++    }
++    // Synchronous execution
++    () = msg![env; op start];
++    if ops != nil {
++        () = msg![env; ops removeObject:op];
++        release(env, op);
++    }
++}
++
++- (())addOperationWithBlock:(id)block {
++    assert!(block != nil);
++    let op: id = msg_class![env; NSBlockOperation blockOperationWithBlock:block];
++    () = msg![env; this addOperation:op];
++    release(env, op);
++}
++
++- (())addOperations:(id)ops waitUntilFinished:(bool)_wait { // NSArray *
++    let count: u32 = msg![env; ops count];
++    for i in 0..count {
++        let op: id = msg![env; ops objectAtIndex:i];
++        () = msg![env; this addOperation:op];
++    }
++}
++
++- (())waitUntilAllOperationsAreFinished {
++    // All operations run synchronously, nothing to wait for.
++}
++
++- (())cancelAllOperations {
++    let ops = env.objc.borrow::<NSOperationQueueHostObject>(this).operations;
++    if ops != nil {
++        let count: u32 = msg![env; ops count];
++        for i in 0..count {
++            let op: id = msg![env; ops objectAtIndex:i];
++            () = msg![env; op cancel];
++        }
++    }
++}
++
++- (i32)maxConcurrentOperationCount {
++    env.objc.borrow::<NSOperationQueueHostObject>(this).max_concurrent
++}
++- (())setMaxConcurrentOperationCount:(i32)count {
++    env.objc.borrow_mut::<NSOperationQueueHostObject>(this).max_concurrent = count;
++}
++- (bool)isSuspended {
++    env.objc.borrow::<NSOperationQueueHostObject>(this).suspended
++}
++- (())setSuspended:(bool)suspended {
++    env.objc.borrow_mut::<NSOperationQueueHostObject>(this).suspended = suspended;
++}
++- (id)name {
++    env.objc.borrow::<NSOperationQueueHostObject>(this).name
++}
++- (())setName:(id)name {
++    retain(env, name);
++    let old = env.objc.borrow::<NSOperationQueueHostObject>(this).name;
++    release(env, old);
++    env.objc.borrow_mut::<NSOperationQueueHostObject>(this).name = name;
++}
++- (id)operations {
++    let ops = env.objc.borrow::<NSOperationQueueHostObject>(this).operations;
++    msg![env; ops copy]
++}
++- (u32)operationCount {
++    let ops = env.objc.borrow::<NSOperationQueueHostObject>(this).operations;
++    msg![env; ops count]
++}
++
++- (())dealloc {
++    let (ops, name) = {
++        let host_obj = env.objc.borrow::<NSOperationQueueHostObject>(this);
++        (host_obj.operations, host_obj.name)
++    };
++    release(env, ops);
++    release(env, name);
++    env.objc.dealloc_object(this, &mut env.mem)
++}
++
++@end
++
++};
+diff --git a/src/frameworks/foundation/ns_thread.rs b/src/frameworks/foundation/ns_thread.rs
+index dddd8cc..f87c0ef 100644
+--- a/src/frameworks/foundation/ns_thread.rs
++++ b/src/frameworks/foundation/ns_thread.rs
+@@ -44,6 +44,8 @@ struct NSThreadHostObject {
+     finished: bool,
+     stack_size: NSUInteger,
+     tolerate_type_mismatch: bool,
++    /// `NSString*`, retained
++    name: id,
+ }
+ impl HostObject for NSThreadHostObject {}
+ 
+@@ -63,6 +65,7 @@ pub const CLASSES: ClassExports = objc_classes! {
+         finished: false,
+         stack_size: Mem::SECONDARY_THREAD_DEFAULT_STACK_SIZE,
+         tolerate_type_mismatch: false,
++        name: nil,
+     });
+     env.objc.alloc_object(this, host_object, &mut env.mem)
+ }
+@@ -202,7 +205,13 @@ pub const CLASSES: ClassExports = objc_classes! {
+ }
+ 
+ - (())setName:(id)name { // NSString *
+-    todo_objc_setter!(this, name);
++    retain(env, name);
++    let old = env.objc.borrow::<NSThreadHostObject>(this).name;
++    release(env, old);
++    env.objc.borrow_mut::<NSThreadHostObject>(this).name = name;
++}
++- (id)name { // NSString *
++    env.objc.borrow::<NSThreadHostObject>(this).name
+ }
+ 
+ // "To change the stack size, you must set this property before starting your
+@@ -228,8 +237,12 @@ pub const CLASSES: ClassExports = objc_classes! {
+ 
+ - (())dealloc {
+     log_dbg!("[(NSThread*){:?} dealloc]", this);
+-    let host_object = env.objc.borrow::<NSThreadHostObject>(this);
+-    release(env, host_object.thread_dictionary);
++    let (thread_dictionary, name) = {
++        let host_object = env.objc.borrow::<NSThreadHostObject>(this);
++        (host_object.thread_dictionary, host_object.name)
++    };
++    release(env, thread_dictionary);
++    release(env, name);
+     env.objc.dealloc_object(this, &mut env.mem)
+ }
+ 
+diff --git a/src/frameworks/foundation/ns_url.rs b/src/frameworks/foundation/ns_url.rs
+index 9111ce3..babd803 100644
+--- a/src/frameworks/foundation/ns_url.rs
++++ b/src/frameworks/foundation/ns_url.rs
+@@ -131,11 +131,26 @@ pub const CLASSES: ClassExports = objc_classes! {
+     match *env.objc.borrow(this) {
+         NSURLHostObject::FileURL { ns_string, .. } => ns_string,
+         NSURLHostObject::OtherURL { ns_string } => {
+-            // TODO: Support full URLs, not only ones that are just a path.
+-            // FIXME: This should do unescaping.
++            // TODO: FIXME: This should do unescaping.
+             // TODO: Avoid copy.
+-            assert!(to_rust_string(env, ns_string).starts_with('/'));
+-            ns_string
++            let url_str = to_rust_string(env, ns_string);
++            // Extract path component from URLs like http://host/path
++            if let Some(scheme_end) = url_str.find("://") {
++                let after_scheme = &url_str[scheme_end + 3..];
++                if let Some(path_start) = after_scheme.find('/') {
++                    let path = &after_scheme[path_start..];
++                    // Return path as new string (simplified: no unescaping)
++                    from_rust_string(env, path.to_string())
++                } else {
++                    // No path component, return "/"
++                    from_rust_string(env, "/".to_string())
++                }
++            } else if url_str.starts_with('/') {
++                ns_string
++            } else {
++                log!("Warning: [NSURL path] called on non-hierarchical URL: {}", url_str);
++                nil
++            }
+         },
+     }
+ }
+diff --git a/src/frameworks/uikit/ui_font.rs b/src/frameworks/uikit/ui_font.rs
+index bbbc43b..a828ad1 100644
+--- a/src/frameworks/uikit/ui_font.rs
++++ b/src/frameworks/uikit/ui_font.rs
+@@ -184,6 +184,10 @@ fn convert_line_break_mode(ui_mode: UILineBreakMode) -> WrapMode {
+         // TODO: support this properly; fake support is so that UILabel works,
+         // which has this as its default line break mode
+         UILineBreakModeTailTruncation => WrapMode::Word,
++        // Clip: no wrapping, text is clipped. Map to Char wrapping as approximation.
++        UILineBreakModeClip => WrapMode::Char,
++        UILineBreakModeHeadTruncation => WrapMode::Word,
++        UILineBreakModeMiddleTruncation => WrapMode::Word,
+         _ => unimplemented!("TODO: line break mode {}", ui_mode),
+     }
+ }
+diff --git a/src/frameworks/uikit/ui_view/ui_window.rs b/src/frameworks/uikit/ui_view/ui_window.rs
+index 1998df4..5d7306f 100644
+--- a/src/frameworks/uikit/ui_view/ui_window.rs
++++ b/src/frameworks/uikit/ui_view/ui_window.rs
+@@ -33,6 +33,8 @@ pub struct State {
+     /// The most recent window which received `makeKeyAndVisible` message.
+     /// Non-retaining!
+     pub key_window: Option<id>,
++    /// Root view controllers by window. Retaining!
++    pub root_view_controllers: std::collections::HashMap<id, id>,
+ }
+ 
+ pub const CLASSES: ClassExports = objc_classes! {
+@@ -138,6 +140,27 @@ pub const CLASSES: ClassExports = objc_classes! {
+     log_dbg!("[(UIWindow*){:?} setScreen:{:?}]", this, screen);
+ }
+ 
++- (id)rootViewController {
++    env.framework_state.uikit.ui_view.ui_window.root_view_controllers.get(&this).copied().unwrap_or(nil)
++}
++- (())setRootViewController:(id)controller {
++    use crate::objc::{release, retain};
++    log_dbg!("[(UIWindow*){:?} setRootViewController:{:?}]", this, controller);
++    let old = env.framework_state.uikit.ui_view.ui_window.root_view_controllers.insert(this, controller);
++    if let Some(old) = old {
++        release(env, old);
++    }
++    if controller != nil {
++        retain(env, controller);
++        // Add the controller's view as a subview of the window.
++        // Simplified: real implementation does view lifecycle, rotation, etc.
++        let view: id = msg![env; controller view];
++        if view != nil {
++            () = msg![env; this addSubview:view];
++        }
++    }
++}
++
+ // UIResponder implementation
+ // From the Apple UIView docs regarding [UIResponder nextResponder]:
+ // "UIWindow returns the application object."
+diff --git a/src/lib.rs b/src/lib.rs
+index fcfec3f..0b37ddd 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -87,14 +87,97 @@ pub extern "C" fn SDL_main(
+         }
+     }));
+ 
+-    // Empty args: brings up app picker.
+-    match main([String::new()].into_iter()) {
++    // [梦幻富翁 点击即玩] 默认传空参数会弹出 app 选择器。这里改为:把内置在
++    // APK assets 里的 DreamDaFuWeng.ipa 复制到外部存储的 touchHLE_apps/(touchHLE 的
++    // BundleData 只能从真实文件路径加载,读不了 APK asset),再用该路径直接启动 →
++    // 跳过选择器 = 点击图标即玩。首次启动、以及换装新版 APK 后各复制一次
++    // (见 ensure_bundled_dfw);更新失败时继续用旧拷贝,连旧拷贝都没有才退回选择器。
++    let args: Vec<String> = match ensure_bundled_dfw() {
++        Some(ipa_path) => vec![
++            String::from("touchHLE"), // argv[0], main() 会跳过
++            ipa_path,
++            String::from("--landscape-right"),
++            String::from("--device-family=ipad"),
++        ],
++        None => vec![String::new()],
++    };
++    match main(args.into_iter()) {
+         Ok(_) => echo!("touchHLE finished"),
+         Err(e) => echo!("touchHLE errored: {e:?}"),
+     }
+     0
+ }
+ 
++/// [梦幻富翁 点击即玩] 确保内置游戏已落到外部存储,返回其 .ipa 路径(失败返回 None)。
++/// 游戏以单个 DreamDaFuWeng.ipa 内置于 APK assets,复制到 touchHLE_apps/DreamDaFuWeng.ipa;
++/// 同一构建内复用,换装新版 APK 后重新复制一次。戳文件内容是本次构建的版本串,戳与本构建
++/// 一致才复用;缺戳或不一致就重新复制。已知限制:本地同一版本反复出包时戳不变,不会重复
++/// 复制(需要时删掉戳文件或清应用数据)。
++#[cfg(target_os = "android")]
++fn ensure_bundled_dfw() -> Option<String> {
++    use std::io::{Read, Write};
++    let apps_dir = paths::user_data_base_path().join(paths::APPS_DIR);
++    let target = apps_dir.join("DreamDaFuWeng.ipa");
++    // 戳文件和下面的临时文件扩展名都不是 .ipa/.app,应用选择器会跳过它们。
++    let stamp = apps_dir.join("DreamDaFuWeng.ipa.stamp");
++    let build_id = format!("dfw-1.0.2 | {}", crate::VERSION);
++    let have_old = target.is_file();
++    if have_old
++        && std::fs::read_to_string(&stamp)
++            .map(|s| s.trim() == build_id.as_str())
++            .unwrap_or(false)
++    {
++        return Some(target.to_string_lossy().into_owned());
++    }
++    let fallback = || {
++        if have_old {
++            echo!("[dfw] 更新内置游戏失败,继续使用已有的 {:?}", target);
++            Some(target.to_string_lossy().into_owned())
++        } else {
++            None
++        }
++    };
++    if let Err(e) = std::fs::create_dir_all(&apps_dir) {
++        echo!("[dfw] 创建目录 {:?} 失败: {:?}", apps_dir, e);
++        return fallback();
++    }
++    // 从 APK assets 读取内置的 DreamDaFuWeng.ipa(经 SDL2 对 Android assets 的封装)。
++    let mut data = Vec::new();
++    match paths::ResourceFile::open("DreamDaFuWeng.ipa") {
++        Ok(mut rf) => {
++            if let Err(e) = rf.get().read_to_end(&mut data) {
++                echo!("[dfw] 读取内置 DreamDaFuWeng.ipa 失败: {:?}", e);
++                return fallback();
++            }
++        }
++        Err(e) => {
++            echo!("[dfw] 打开内置 DreamDaFuWeng.ipa (APK asset) 失败: {}", e);
++            return fallback();
++        }
++    }
++    // 先写同目录的临时文件并落盘,再 rename 原子替换:中途被杀或空间不足,都不会留下半截文件。
++    let tmp = apps_dir.join("DreamDaFuWeng.ipa.tmp");
++    let written = std::fs::File::create(&tmp).and_then(|mut f| {
++        f.write_all(&data)?;
++        f.sync_all()
++    });
++    if let Err(e) = written {
++        echo!("[dfw] 写入 {:?} 失败: {:?}", tmp, e);
++        let _ = std::fs::remove_file(&tmp);
++        return fallback();
++    }
++    if let Err(e) = std::fs::rename(&tmp, &target) {
++        echo!("[dfw] 替换 {:?} 失败: {:?}", target, e);
++        let _ = std::fs::remove_file(&tmp);
++        return fallback();
++    }
++    // 戳最后写:替换成功后才记下本构建。戳写失败只会让下次启动再复制一遍,不会误用旧包。
++    if let Err(e) = std::fs::write(&stamp, &build_id) {
++        echo!("[dfw] 写入戳文件失败: {:?}", e);
++    }
++    Some(target.to_string_lossy().into_owned())
++}
++
+ const USAGE: &str = "\
+ Usage:
+     touchHLE [PATH] [OPTIONS]
+diff --git a/src/libc.rs b/src/libc.rs
+index 69d34cd..65d2d7e 100644
+--- a/src/libc.rs
++++ b/src/libc.rs
+@@ -13,10 +13,12 @@ mod generic_char;
+ 
+ pub mod arpa;
+ pub mod clocale;
++pub mod common_crypto;
+ pub mod crypto;
+ pub mod ctype;
+ pub mod cxxabi;
+ pub mod dirent;
++pub mod dispatch;
+ pub mod dlfcn;
+ pub mod dns_sd;
+ pub mod errno;
+@@ -54,10 +56,12 @@ pub const DYLIB: crate::dyld::HostDylib = crate::dyld::HostDylib {
+     function_exports: &[
+         arpa::inet::FUNCTIONS,
+         clocale::FUNCTIONS,
++        common_crypto::FUNCTIONS,
+         ctype::FUNCTIONS,
+         cxxabi::FUNCTIONS,
+         crypto::FUNCTIONS,
+         dirent::FUNCTIONS,
++        dispatch::FUNCTIONS,
+         dlfcn::FUNCTIONS,
+         dns_sd::FUNCTIONS,
+         errno::FUNCTIONS,
+@@ -117,6 +121,7 @@ pub const DYLIB: crate::dyld::HostDylib = crate::dyld::HostDylib {
+ /// Container for state of various child modules
+ #[derive(Default)]
+ pub struct State {
++    pub common_crypto: common_crypto::State,
+     crypto: crypto::State,
+     dirent: dirent::State,
+     keymgr: keymgr::State,
+diff --git a/src/libc/common_crypto.rs b/src/libc/common_crypto.rs
+new file mode 100644
+index 0000000..efdb227
+--- /dev/null
++++ b/src/libc/common_crypto.rs
+@@ -0,0 +1,184 @@
++/*
++ * This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at https://mozilla.org/MPL/2.0/.
++ */
++//! CommonCrypto (`/usr/lib/system/libcommonCrypto.dylib`).
++//!
++//! Minimal implementation: HMAC (MD5/SHA1/SHA256) and one-shot hashes.
++
++use crate::dyld::{export_c_func, FunctionExports};
++use crate::mem::{ConstVoidPtr, GuestUSize, MutVoidPtr};
++use crate::Environment;
++use std::collections::HashMap;
++
++// CCHmacAlgorithm values
++const K_CC_HMAC_ALG_SHA1: u32 = 0;
++const K_CC_HMAC_ALG_MD5: u32 = 1;
++const K_CC_HMAC_ALG_SHA256: u32 = 2;
++
++#[derive(Default)]
++pub struct State {
++    hmac_contexts: HashMap<u32, HmacState>,
++}
++impl State {
++    fn get(env: &mut Environment) -> &mut Self {
++        &mut env.libc_state.common_crypto
++    }
++}
++
++struct HmacState {
++    algorithm: u32,
++    key: Vec<u8>,
++    data: Vec<u8>,
++}
++
++fn CCHmacInit(
++    env: &mut Environment,
++    ctx: MutVoidPtr,
++    algorithm: u32,
++    key: ConstVoidPtr,
++    key_length: u32,
++) {
++    let key_bytes = env
++        .mem
++        .bytes_at(key.cast(), key_length as GuestUSize)
++        .to_vec();
++    log_dbg!(
++        "CCHmacInit({:?}, alg={}, key_len={})",
++        ctx,
++        algorithm,
++        key_length
++    );
++    State::get(env).hmac_contexts.insert(
++        ctx.to_bits(),
++        HmacState {
++            algorithm,
++            key: key_bytes,
++            data: Vec::new(),
++        },
++    );
++}
++
++fn CCHmacUpdate(env: &mut Environment, ctx: MutVoidPtr, data: ConstVoidPtr, data_length: u32) {
++    let data_bytes = env
++        .mem
++        .bytes_at(data.cast(), data_length as GuestUSize)
++        .to_vec();
++    log_dbg!("CCHmacUpdate({:?}, len={})", ctx, data_length);
++    let state = State::get(env)
++        .hmac_contexts
++        .get_mut(&ctx.to_bits())
++        .expect("CCHmacUpdate on unknown context");
++    state.data.extend_from_slice(&data_bytes);
++}
++
++fn CCHmacFinal(env: &mut Environment, ctx: MutVoidPtr, mac_out: MutVoidPtr) {
++    log_dbg!("CCHmacFinal({:?})", ctx);
++    let state = State::get(env)
++        .hmac_contexts
++        .remove(&ctx.to_bits())
++        .expect("CCHmacFinal on unknown context");
++    let result = hmac_compute_manual(state.algorithm, &state.key, &state.data);
++    env.mem
++        .bytes_at_mut(mac_out.cast(), result.len() as GuestUSize)
++        .copy_from_slice(&result);
++}
++
++// Manual HMAC implementation to avoid the hmac crate dependency.
++fn hmac_compute_manual(algorithm: u32, key: &[u8], data: &[u8]) -> Vec<u8> {
++    use digest::Digest;
++    let (block_size, hash_fn): (usize, Box<dyn Fn(&[u8]) -> Vec<u8>>) = match algorithm {
++        K_CC_HMAC_ALG_MD5 => (
++            64,
++            Box::new(|d| {
++                let mut h = md5::Md5::new();
++                h.update(d);
++                h.finalize().to_vec()
++            }),
++        ),
++        K_CC_HMAC_ALG_SHA1 => (
++            64,
++            Box::new(|d| {
++                let mut h = sha1::Sha1::new();
++                h.update(d);
++                h.finalize().to_vec()
++            }),
++        ),
++        K_CC_HMAC_ALG_SHA256 => (
++            64,
++            Box::new(|d| {
++                let mut h = sha2::Sha256::new();
++                h.update(d);
++                h.finalize().to_vec()
++            }),
++        ),
++        _ => panic!("Unsupported HMAC algorithm {}", algorithm),
++    };
++
++    // HMAC(K, m) = H((K' ^ opad) || H((K' ^ ipad) || m))
++    let mut key_block = vec![0u8; block_size];
++    if key.len() > block_size {
++        let hashed = hash_fn(key);
++        key_block[..hashed.len()].copy_from_slice(&hashed);
++    } else {
++        key_block[..key.len()].copy_from_slice(key);
++    }
++    let mut ipad = vec![0x36u8; block_size];
++    let mut opad = vec![0x5cu8; block_size];
++    for i in 0..block_size {
++        ipad[i] ^= key_block[i];
++        opad[i] ^= key_block[i];
++    }
++    let mut inner = ipad;
++    inner.extend_from_slice(data);
++    let inner_hash = hash_fn(&inner);
++    let mut outer = opad;
++    outer.extend_from_slice(&inner_hash);
++    hash_fn(&outer)
++}
++
++fn CC_MD5(env: &mut Environment, data: ConstVoidPtr, len: u32, md: MutVoidPtr) -> MutVoidPtr {
++    use digest::Digest;
++    let bytes = env.mem.bytes_at(data.cast(), len as GuestUSize);
++    let mut hasher = md5::Md5::new();
++    hasher.update(bytes);
++    let result = hasher.finalize();
++    env.mem
++        .bytes_at_mut(md.cast(), result.len() as GuestUSize)
++        .copy_from_slice(&result);
++    md
++}
++
++fn CC_SHA1(env: &mut Environment, data: ConstVoidPtr, len: u32, md: MutVoidPtr) -> MutVoidPtr {
++    use digest::Digest;
++    let bytes = env.mem.bytes_at(data.cast(), len as GuestUSize);
++    let mut hasher = sha1::Sha1::new();
++    hasher.update(bytes);
++    let result = hasher.finalize();
++    env.mem
++        .bytes_at_mut(md.cast(), result.len() as GuestUSize)
++        .copy_from_slice(&result);
++    md
++}
++
++fn CC_SHA256(env: &mut Environment, data: ConstVoidPtr, len: u32, md: MutVoidPtr) -> MutVoidPtr {
++    use digest::Digest;
++    let bytes = env.mem.bytes_at(data.cast(), len as GuestUSize);
++    let mut hasher = sha2::Sha256::new();
++    hasher.update(bytes);
++    let result = hasher.finalize();
++    env.mem
++        .bytes_at_mut(md.cast(), result.len() as GuestUSize)
++        .copy_from_slice(&result);
++    md
++}
++
++pub const FUNCTIONS: FunctionExports = &[
++    export_c_func!(CCHmacInit(_, _, _, _)),
++    export_c_func!(CCHmacUpdate(_, _, _)),
++    export_c_func!(CCHmacFinal(_, _)),
++    export_c_func!(CC_MD5(_, _, _)),
++    export_c_func!(CC_SHA1(_, _, _)),
++    export_c_func!(CC_SHA256(_, _, _)),
++];
+diff --git a/src/libc/cxxabi.rs b/src/libc/cxxabi.rs
+index ead0a6c..8c79ef1 100644
+--- a/src/libc/cxxabi.rs
++++ b/src/libc/cxxabi.rs
+@@ -34,7 +34,80 @@ fn __cxa_finalize(_env: &mut Environment, d: MutVoidPtr) {
+     log!("TODO: __cxa_finalize({:?}) (unimplemented)", d);
+ }
+ 
++fn _Unwind_SjLj_Register(_env: &mut Environment, fc: MutVoidPtr) {
++    // SjLj (setjmp/longjmp) exception handling registration. We don't support
++    // unwinding; this is a no-op for code that never actually throws.
++    log_dbg!("_Unwind_SjLj_Register({:?}) (no-op)", fc);
++}
++
++fn _Unwind_SjLj_Unregister(_env: &mut Environment, fc: MutVoidPtr) {
++    log_dbg!("_Unwind_SjLj_Unregister({:?}) (no-op)", fc);
++}
++
++fn _Unwind_SjLj_Resume(_env: &mut Environment, fc: MutVoidPtr) {
++    // Called when an exception is re-thrown; we don't support unwinding.
++    panic!("_Unwind_SjLj_Resume({:?}) called: exception unwinding is not supported", fc);
++}
++
++// ARM EABI integer division/modulo helpers (compiler-rt builtins).
++// The Rust function names have two leading underscores so that
++// `export_c_func!` (which prepends one more) produces the correct
++// three-underscore Mach-O symbols (e.g. `___modsi3`).
++fn __modsi3(_env: &mut Environment, a: i32, b: i32) -> i32 {
++    a % b
++}
++fn __divsi3(_env: &mut Environment, a: i32, b: i32) -> i32 {
++    a / b
++}
++fn __umodsi3(_env: &mut Environment, a: u32, b: u32) -> u32 {
++    a % b
++}
++fn __udivsi3(_env: &mut Environment, a: u32, b: u32) -> u32 {
++    a / b
++}
++// 64-bit division/modulo helpers
++fn __moddi3(_env: &mut Environment, a: i64, b: i64) -> i64 {
++    a % b
++}
++fn __divdi3(_env: &mut Environment, a: i64, b: i64) -> i64 {
++    a / b
++}
++fn __umoddi3(_env: &mut Environment, a: u64, b: u64) -> u64 {
++    a % b
++}
++fn __udivdi3(_env: &mut Environment, a: u64, b: u64) -> u64 {
++    a / b
++}
++// Integer to float conversion helpers
++fn __floatdisf(_env: &mut Environment, a: i32) -> f32 {
++    a as f32
++}
++fn __floatundisf(_env: &mut Environment, a: u32) -> f32 {
++    a as f32
++}
++fn __floatdidf(_env: &mut Environment, a: i64) -> f64 {
++    a as f64
++}
++fn __floatundidf(_env: &mut Environment, a: u64) -> f64 {
++    a as f64
++}
++
+ pub const FUNCTIONS: FunctionExports = &[
+     export_c_func!(__cxa_atexit(_, _, _)),
+     export_c_func!(__cxa_finalize(_)),
++    export_c_func!(_Unwind_SjLj_Register(_)),
++    export_c_func!(_Unwind_SjLj_Unregister(_)),
++    export_c_func!(_Unwind_SjLj_Resume(_)),
++    export_c_func!(__modsi3(_, _)),
++    export_c_func!(__divsi3(_, _)),
++    export_c_func!(__umodsi3(_, _)),
++    export_c_func!(__udivsi3(_, _)),
++    export_c_func!(__moddi3(_, _)),
++    export_c_func!(__divdi3(_, _)),
++    export_c_func!(__umoddi3(_, _)),
++    export_c_func!(__udivdi3(_, _)),
++    export_c_func!(__floatdisf(_)),
++    export_c_func!(__floatundisf(_)),
++    export_c_func!(__floatdidf(_)),
++    export_c_func!(__floatundidf(_)),
+ ];
+diff --git a/src/libc/dispatch.rs b/src/libc/dispatch.rs
+new file mode 100644
+index 0000000..abc6155
+--- /dev/null
++++ b/src/libc/dispatch.rs
+@@ -0,0 +1,38 @@
++/*
++ * This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at https://mozilla.org/MPL/2.0/.
++ */
++//! Grand Central Dispatch (`/usr/lib/system/libdispatch.dylib`).
++//!
++//! Minimal implementation: `dispatch_once`.
++
++use crate::dyld::{export_c_func, FunctionExports};
++use crate::frameworks::foundation::ns_operation_queue::invoke_block;
++use crate::mem::{MutPtr, MutVoidPtr};
++use crate::objc::id;
++use crate::Environment;
++
++fn dispatch_once(env: &mut Environment, predicate: MutPtr<i32>, block: id) {
++    log!("dispatch_once(predicate={:?}, block={:?})", predicate, block);
++    // Sanity check: block should be a valid user-space pointer.
++    // If it's clearly invalid (e.g., kernel space address), skip.
++    let block_addr = block.to_bits();
++    if block_addr >= 0xFFFF0000 {
++        log!("Warning: dispatch_once called with invalid block {:?}, skipping", block);
++        // Still mark predicate as done to avoid infinite loop
++        env.mem.write(predicate.cast(), -1i32);
++        return;
++    }
++    // dispatch_once_t is a long (4 bytes on 32-bit)
++    let done: i32 = env.mem.read(predicate.cast());
++    if done == 0 {
++        log_dbg!("dispatch_once({:?}): executing block {:?}", predicate, block);
++        invoke_block(env, block);
++        env.mem.write(predicate.cast(), -1i32);
++    } else {
++        log_dbg!("dispatch_once({:?}): already executed", predicate);
++    }
++}
++
++pub const FUNCTIONS: FunctionExports = &[export_c_func!(dispatch_once(_, _))];
+diff --git a/src/objc.rs b/src/objc.rs
+index 065cd62..4f4dcaa 100644
+--- a/src/objc.rs
++++ b/src/objc.rs
+@@ -117,6 +117,42 @@ const CONSTANTS: ConstantExports = &[
+     // and avoids a linker error for the integration tests.
+     ("__objc_empty_vtable", HostConstant::NullPtr),
+     ("__objc_empty_cache", HostConstant::NullPtr),
++    // Block isa classes. The binary references these as C variables
++    // (e.g. `__NSConcreteStackBlock`), which point to the class objects.
++    (
++        "__NSConcreteStackBlock",
++        HostConstant::Custom(|env| {
++            let class = env.objc.get_known_class("_NSConcreteStackBlock", &mut env.mem);
++            class.cast().cast_const()
++        }),
++    ),
++    (
++        "__NSConcreteGlobalBlock",
++        HostConstant::Custom(|env| {
++            let class = env.objc.get_known_class("_NSConcreteGlobalBlock", &mut env.mem);
++            class.cast().cast_const()
++        }),
++    ),
++    (
++        "__NSConcreteMallocBlock",
++        HostConstant::Custom(|env| {
++            let class = env.objc.get_known_class("_NSConcreteMallocBlock", &mut env.mem);
++            class.cast().cast_const()
++        }),
++    ),
++    // Stack protection canary. The binary was compiled with -fstack-protector,
++    // so it references `__stack_chk_guard`. We don't actually validate the
++    // canary, but the code double-dereferences it, so we make it self-referential
++    // to avoid crashes.
++    (
++        "___stack_chk_guard",
++        HostConstant::Custom(|env| {
++            let ptr: crate::mem::MutPtr<u32> = env.mem.alloc(4).cast();
++            // Self-referential: *ptr = ptr, so double-deref is safe.
++            env.mem.write(ptr, ptr.to_bits());
++            ptr.cast_const().cast()
++        }),
++    ),
+ ];
+ 
+ /// Block support is iOS 4+, but it seems like Block Runtime Helpers
+diff --git a/src/objc/messages.rs b/src/objc/messages.rs
+index 03a6f99..79cc301 100644
+--- a/src/objc/messages.rs
++++ b/src/objc/messages.rs
+@@ -35,7 +35,11 @@ pub(super) struct ThreadInitializer {
+ }
+ 
+ fn maybe_initialize_class(env: &mut Environment, receiver: id) {
+-    let class_host_object = env.objc.get_host_object(receiver).unwrap();
++    let Some(class_host_object) = env.objc.get_host_object(receiver) else {
++        // The receiver has no host object (e.g. a block literal or other
++        // guest-created object). There's no +initialize to send.
++        return;
++    };
+     let Some(&super::ClassHostObject {
+         superclass,
+         is_metaclass,
