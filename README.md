@@ -10,8 +10,17 @@
 |---|---|
 | `dfw.patch` | 相对上游 touchHLE `d34530b` 的完整补丁，`git apply` 即可 |
 | `BUILD.md` | 从源码编出 APK 的完整步骤 |
-| `android-build/` | 手工打包用的最终形态 Android 文件（Manifest/资源/Java stub/图标） |
-| `DreamDaFuWeng.ipa` | 游戏本体（29.6 MB，APK 的 assets 用；为方便 AI 自包含） |
+| `android-build/` | 手工打包用的最终形态 Android 文件（Manifest/资源/Java stub） |
+
+## 需要你自己准备的两个文件（不在仓库里）
+
+1. **`DreamDaFuWeng.ipa`**（约 29.6 MB）：游戏本体。就是砸壳版 ipa
+   改名，里面是 `dfw2012_chs_ipad.app`（cryptid=0，已解密）。
+   打包时放到 APK 的 `assets/` 下，名字必须 exactly
+   `DreamDaFuWeng.ipa`（lib.rs 里写死了从 assets 读这个名字）。
+2. **`android-build/res/drawable-nodpi/icon.png`**（192x192 PNG）：
+   应用图标。原版图标是 Apple CgBI 格式 aapt2 读不了，
+   随便找张 PNG 放这里当占位即可，不影响运行。
 
 ## 快速开始（给 AI）
 
@@ -24,7 +33,7 @@
 - Linux Xvfb：120 秒+ 稳定运行，60 FPS，标题画面正常。
 - Android APK：已构建（35 MB，`org.touchhle.dreamdafuweng`），
   小米 14 Pro 真机安装验证中。
-- 两处将就：临时骰子图标、极简 DocumentsProvider stub（见 BUILD.md）。
+- 两处将就：临时占位图标、极简 DocumentsProvider stub（见 BUILD.md）。
 
 上游：https://github.com/hikari-no-yume/touchHLE
 参考：https://github.com/moleworld-dev/MoleWorld-5.5.0-touchHLE-offline
