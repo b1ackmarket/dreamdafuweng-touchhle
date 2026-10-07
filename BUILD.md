@@ -105,8 +105,9 @@ targetSdk 31，label `梦幻富翁`）：
 
 - `android-build/AndroidManifest.xml`
 - `android-build/res/values/strings.xml`
-- `android-build/res/drawable-nodpi/icon.png`（临时骰子占位图标；
-  原版图标是 Apple CgBI PNG，aapt2 读不了）
+- `android-build/res/drawable-nodpi/icon.png`（**需自备**：任意 192x192 PNG
+  放这里当占位图标；原版图标是 Apple CgBI PNG，aapt2 读不了，
+  随便找张图不影响运行）
 
 ```bash
 aapt2 compile --dir android-build/res -o compiled_res.zip
