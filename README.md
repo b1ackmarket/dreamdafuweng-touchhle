@@ -1,39 +1,70 @@
-# 梦幻富翁 touchHLE 移植（Android arm64）
+# 梦幻富翁 iPad HD - touchHLE Android 移植
 
-把 iOS 老游戏《梦幻富翁 iPad HD》（armv7 单架构，iOS 5.1.1+）
-搬到现代 64 位 Android：**64 位 touchHLE 宿主直接运行原版 ARMv7
-客体**，不是重写。
+将 iOS 经典游戏《梦幻富翁 iPad HD》(v1.0.2) 通过 touchHLE 模拟器移植到 Android arm64。
 
-## 仓库内容
+- 上游: hikari-no-yume/touchHLE@d34530b
+- 目标设备: 小米 14 Pro (Android arm64)
+- 游戏: dfw2012_chs_ipad.app (armv7, OpenGL ES 1.1, 自研引擎, 非 cocos2d)
 
-| 文件 | 说明 |
-|---|---|
-| `dfw.patch` | 相对上游 touchHLE `d34530b` 的完整补丁，`git apply` 即可 |
-| `BUILD.md` | 从源码编出 APK 的完整步骤 |
-| `android-build/` | 手工打包用的最终形态 Android 文件（Manifest/资源/Java stub） |
+## 当前进展 (2026-10-08, v24)
 
-## 需要你自己准备的两个文件（不在仓库里）
+### 可玩状态
+- ✅ 正常进入标题画面
+- ✅ 点击进入主菜单 → 单人游戏 → 通关模式
+- ✅ 进入游戏棋盘，掷骰子走棋
+- ✅ 点击游戏右侧不再崩溃 (v22 修复 UIGestureRecognizer)
 
-1. **`DreamDaFuWeng.ipa`**（约 29.6 MB）：游戏本体。就是砸壳版 ipa
-   改名，里面是 `dfw2012_chs_ipad.app`（cryptid=0，已解密）。
-   打包时放到 APK 的 `assets/` 下，名字必须 exactly
-   `DreamDaFuWeng.ipa`（lib.rs 里写死了从 assets 读这个名字）。
-2. **`android-build/res/drawable-nodpi/icon.png`**（192x192 PNG）：
-   应用图标。原版图标是 Apple CgBI 格式 aapt2 读不了，
-   随便找张 PNG 放这里当占位即可，不影响运行。
+### 已知问题
+- ⚠️ AI 角色会在两局内破产 (原因未找到；已排除随机数和 NSDecimalNumber)
+- ⚠️ 部分数字显示反转、部分汉字乱码 (疑似 CoreText 未实现)
+- ⚠️ 游戏胜利后可能闪退 ("left == right" 断言，需复现抓日志)
+- ⚠️ 画面为 4:3 居中，两侧有黑边 (用户要求保持比例，不拉伸)
 
-## 快速开始（给 AI）
+### 技术要点
+- 动态链接 libSDL2.so (静态链接会导致 SDL JNI 未初始化崩溃)
+- 补齐 guest intrinsic: `__divmodsi4`, `__floatundisf`, `__fixsfdi` 等
+- mutex 重复 unlock 改为容错 (不 panic)
+- `UIGestureRecognizer` 及其子类走 FakeClass 兼容路径
+- 新增 `NSDecimalNumber` 最小实现 (金钱计算)
+- 新增 GCD `dispatch_async/sync/get_global_queue` (同步执行代替)
 
-1. 读 `BUILD.md`，按步骤来。
-2. 先在 Linux 下把游戏跑起来（标题画面 + 60 FPS），再打 Android 包。
-3. 签名必须是组装完所有文件后的最后一步，否则 v2 签名失效装不上。
+## 文件说明
 
-## 状态
+- `dfw.patch`: 相对上游 d34530b 的完整补丁，`git apply` 即用
+- `BUILD.md`: 完整编译步骤
+- `build-v17.sh`: Android arm64 构建脚本
+- `android-build/`: 加工好的 Manifest/资源/Java stub
 
-- Linux Xvfb：120 秒+ 稳定运行，60 FPS，标题画面正常。
-- Android APK：已构建（35 MB，`org.touchhle.dreamdafuweng`），
-  小米 14 Pro 真机安装验证中。
-- 两处将就：临时占位图标、极简 DocumentsProvider stub（见 BUILD.md）。
+> 注意: `DreamDaFuWeng.ipa` (29MB) 因体积原因未进仓库，需自备放入 `android/app/src/main/assets/`
 
-上游：https://github.com/hikari-no-yume/touchHLE
-参考：https://github.com/moleworld-dev/MoleWorld-5.5.0-touchHLE-offline
+## 构建
+
+```bash
+# 1. 应用补丁
+cd touchHLE && git apply ../dfw.patch
+
+# 2. 编译 (见 build-v17.sh)
+cargo ndk --target aarch64-linux-android --platform 21 -- \
+  build --release \
+  --no-default-features \
+  --features sdl2/bundled,touchHLE_openal_soft_wrapper/static
+# RUSTFLAGS 需指向 sdl2-sys 编出的 libSDL2.so
+
+# 3. 打包 APK (手动路线: javac + d8 + aapt2 + apksigner)
+```
+
+详见 `BUILD.md`。
+
+## 版本历史
+
+| 版本 | 日期 | 说明 |
+|------|------|------|
+| v3 | 2026-10-07 | 稳定基线，能进主界面 |
+| v17 | 2026-10-07 | 恢复动态 SDL 链接，越过 divmod 死点 |
+| v18 | 2026-10-08 | 补浮点 intrinsic，进主界面但 mutex panic |
+| v19 | 2026-10-08 | mutex 容错 |
+| v20 | 2026-10-08 | 补 `__fixsfdi` 等；ADB 验证进入棋盘 |
+| v21 | 2026-10-08 | 强制拉伸全屏 (用户否定：比例更重要，已废弃) |
+| v22 | 2026-10-08 | UIGestureRecognizer 防崩 + 恢复 4:3 比例 |
+| v23 | 2026-10-08 | 与 v22 内容相同 (重新打包，无新修复) |
+| v24 | 2026-10-08 | 新增 NSDecimalNumber / GCD / UIGraphics 桩 |
